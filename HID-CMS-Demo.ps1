@@ -114,12 +114,17 @@ if ($State -eq 0) {
 
     Write-Log "Setting up scheduled task to resume setup after reboot..."
     $ScriptPath = $MyInvocation.MyCommand.Path
-    # Persist the script path so State 1 can re-register the task with domain credentials.
+    # Persist the script path so later states can re-register the task.
     New-ItemProperty -Path $StateKey -Name "ScriptPath" -Value $ScriptPath -PropertyType String -Force | Out-Null
-    # State 0->1 runs as SYSTEM/AtStartup (no domain exists yet, just need a reboot for rename).
+    # Capture current user identity (local Administrator) so the resume task runs in their
+    # interactive session — this makes the PowerShell window visible after the rename reboot.
+    $CurrentUser = [System.Security.Principal.WindowsIdentity]::GetCurrent().Name
+    New-ItemProperty -Path $StateKey -Name "LocalAdmin" -Value $CurrentUser -PropertyType String -Force | Out-Null
+    Write-Log "Registering AtLogon resume task for user: $CurrentUser"
     $Action = New-ScheduledTaskAction -Execute 'PowerShell.exe' -Argument "-ExecutionPolicy Bypass -WindowStyle Maximized -NoExit -File `"$ScriptPath`""
-    $Trigger = New-ScheduledTaskTrigger -AtStartup
-    Register-ScheduledTask -TaskName "ResumeDemoSetup" -Action $Action -Trigger $Trigger -User "NT AUTHORITY\SYSTEM" -RunLevel Highest | Out-Null
+    $Trigger = New-ScheduledTaskTrigger -AtLogOn -User $CurrentUser
+    $Principal = New-ScheduledTaskPrincipal -UserId $CurrentUser -LogonType Interactive -RunLevel Highest
+    Register-ScheduledTask -TaskName "ResumeDemoSetup" -Action $Action -Trigger $Trigger -Principal $Principal -Force | Out-Null
 
     Write-Log "Renaming computer to $MachineName and rebooting..."
     Set-ItemProperty -Path $StateKey -Name "State" -Value 1
