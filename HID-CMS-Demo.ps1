@@ -114,7 +114,9 @@ if ($State -eq 0) {
 
     Write-Log "Setting up scheduled task to resume setup after reboot..."
     $ScriptPath = $MyInvocation.MyCommand.Path
-    # Use Maximized window style so the user can see script progress resume; -NoExit keeps window open after completion
+    # Persist the script path so State 1 can re-register the task with domain credentials.
+    New-ItemProperty -Path $StateKey -Name "ScriptPath" -Value $ScriptPath -PropertyType String -Force | Out-Null
+    # State 0->1 runs as SYSTEM/AtStartup (no domain exists yet, just need a reboot for rename).
     $Action = New-ScheduledTaskAction -Execute 'PowerShell.exe' -Argument "-ExecutionPolicy Bypass -WindowStyle Maximized -NoExit -File `"$ScriptPath`""
     $Trigger = New-ScheduledTaskTrigger -AtStartup
     Register-ScheduledTask -TaskName "ResumeDemoSetup" -Action $Action -Trigger $Trigger -User "NT AUTHORITY\SYSTEM" -RunLevel Highest | Out-Null
@@ -140,6 +142,20 @@ if ($State -eq 1) {
 
     Write-Log "Promoting server to Domain Controller ($DomainName)..."
     Set-ItemProperty -Path $StateKey -Name "State" -Value 2
+
+    # Re-register the resume task to run as Domain Admin in an interactive session.
+    # After this reboot the local Administrator becomes HID\Administrator, so SYSTEM
+    # (Session 0) is the wrong identity for ADCS, SMB shares, and SQL setup.
+    # Using AtLogon + Interactive means the script resumes visibly when the user logs in.
+    $NetBIOS = $DomainName.Split('.')[0].ToUpper()   # "hid.demo" -> "HID"
+    $DomainAdmin = "$NetBIOS\Administrator"
+    $SavedPath = (Get-ItemProperty -Path $StateKey).ScriptPath
+    $Action2 = New-ScheduledTaskAction -Execute 'PowerShell.exe' -Argument "-ExecutionPolicy Bypass -WindowStyle Maximized -NoExit -File `"$SavedPath`""
+    $Trigger2 = New-ScheduledTaskTrigger -AtLogOn -User $DomainAdmin
+    $Principal2 = New-ScheduledTaskPrincipal -UserId $DomainAdmin -LogonType Interactive -RunLevel Highest
+    Unregister-ScheduledTask -TaskName "ResumeDemoSetup" -Confirm:$false -ErrorAction SilentlyContinue
+    Register-ScheduledTask -TaskName "ResumeDemoSetup" -Action $Action2 -Trigger $Trigger2 -Principal $Principal2 -Force | Out-Null
+    Write-Log "Resume task updated: will run as $DomainAdmin in interactive session on next logon."
 
     Install-ADDSForest -CreateDnsDelegation:$false -DatabasePath "C:\Windows\NTDS" `
         -DomainMode "7" -DomainName $DomainName -ForestMode "7" `
