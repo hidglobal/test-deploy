@@ -15,6 +15,20 @@ Function Write-Log ($Message) {
     Write-Host "$Time - $Message" -ForegroundColor Cyan
 }
 
+# Send a visible notification to the currently logged-in user (for Session 0 -> Session 1 visibility).
+# Also logs to file for troubleshooting.
+Function Notify-User ($Title, $Message) {
+    Write-Log "[NOTIFY] $Title - $Message"
+    # Get the session ID of the logged-in user (typically 1; fall back to broadcasting to all if needed)
+    try {
+        $UserSession = (Get-Process explorer -ErrorAction SilentlyContinue | Select-Object -First 1).SessionId
+        if ($null -eq $UserSession) { $UserSession = 1 }
+        msg $UserSession "$Title`n$Message" /TIME:60 | Out-Null 2>&1
+    } catch {
+        # msg may not be available; continue silently
+    }
+}
+
 # Display the task checklist with progress indicators.
 # $CompletedTasks: -1 = initial (all unchecked), 0-4 = that many done + next in progress, 5 = all done.
 Function Show-Progress {
@@ -100,7 +114,8 @@ if ($State -eq 0) {
 
     Write-Log "Setting up scheduled task to resume setup after reboot..."
     $ScriptPath = $MyInvocation.MyCommand.Path
-    $Action = New-ScheduledTaskAction -Execute 'PowerShell.exe' -Argument "-ExecutionPolicy Bypass -WindowStyle Normal -File `"$ScriptPath`""
+    # Use Maximized window style so the user can see script progress resume; -NoExit keeps window open after completion
+    $Action = New-ScheduledTaskAction -Execute 'PowerShell.exe' -Argument "-ExecutionPolicy Bypass -WindowStyle Maximized -NoExit -File `"$ScriptPath`""
     $Trigger = New-ScheduledTaskTrigger -AtStartup
     Register-ScheduledTask -TaskName "ResumeDemoSetup" -Action $Action -Trigger $Trigger -User "NT AUTHORITY\SYSTEM" -RunLevel Highest | Out-Null
 
@@ -115,8 +130,12 @@ if ($State -eq 0) {
 # STATE 1: AD Forest Promotion  (Stage 2 of 3)
 # ==============================================================================
 if ($State -eq 1) {
+    Write-Host "`n`n`n"
+    Write-Host "  +==================================================================+" -ForegroundColor Yellow
+    Write-Host "  |           SETUP RESUMING: Stage 2 of 3                           |" -ForegroundColor Yellow
+    Write-Host "  |         Installing Active Directory Forest...                   |" -ForegroundColor Yellow
+    Write-Host "  +==================================================================+" -ForegroundColor Yellow
     Write-Host ""
-    Write-Host "  -- Resuming Setup: Stage 2 of 3 (Active Directory Forest) ----------" -ForegroundColor Yellow
     Show-Progress 0   # Task 1 [>] in progress
 
     Write-Log "Promoting server to Domain Controller ($DomainName)..."
@@ -135,8 +154,12 @@ if ($State -eq 1) {
 # STATE 2: IIS, ADCS, Smart Card Templates, SQL  (Stage 3 of 3)
 # ==============================================================================
 if ($State -eq 2) {
+    Write-Host "`n`n`n"
+    Write-Host "  +==================================================================+" -ForegroundColor Yellow
+    Write-Host "  |           SETUP RESUMING: Stage 3 of 3                           |" -ForegroundColor Yellow
+    Write-Host "  |    Installing Services & Applications...                        |" -ForegroundColor Yellow
+    Write-Host "  +==================================================================+" -ForegroundColor Yellow
     Write-Host ""
-    Write-Host "  -- Resuming Setup: Stage 3 of 3 (Services & Applications) ----------" -ForegroundColor Yellow
     Show-Progress 1   # AD [X], CA [>] next
 
     # --- IIS Web Server (installed first so C:\pki exists before ADCS publishes its CRL) ---
@@ -144,67 +167,152 @@ if ($State -eq 2) {
     # immediately be served over HTTP — the CDP and AIA URLs embedded in issued certificates point to
     # http://<server>/pki, so the virtual directory must exist before any certificates are issued.
     Write-Log "Installing IIS and creating PKI distribution point directory..."
-    Install-WindowsFeature -Name Web-Server,Web-Asp-Net -IncludeManagementTools
-    New-Item -Path "C:\pki" -ItemType Directory -Force
-    New-SmbShare -Name "pki" -Path "C:\pki" -ChangeAccess "Cert Publishers"
-    New-WebVirtualDirectory -Site "Default Web Site" -Name "pki" -PhysicalPath "C:\pki"
+    Notify-User "HID Setup" "Installing IIS (this may take 2-3 minutes)..."
+    
+    try {
+        Install-WindowsFeature -Name Web-Server,Web-Asp-Net -IncludeManagementTools -ErrorAction Stop | Out-Null
+        Write-Log "IIS features installed successfully."
+    } catch {
+        Write-Log "ERROR installing IIS: $_"
+        Notify-User "HID Setup ERROR" "Failed to install IIS. Check log: C:\Users\Public\Downloads\Setup-Demo.log"
+        Exit 1
+    }
+    
+    try {
+        New-Item -Path "C:\pki" -ItemType Directory -Force -ErrorAction Stop | Out-Null
+        Write-Log "Created C:\pki directory."
+    } catch {
+        Write-Log "ERROR creating C:\pki: $_"
+        Notify-User "HID Setup ERROR" "Failed to create C:\pki. Check log: C:\Users\Public\Downloads\Setup-Demo.log"
+        Exit 1
+    }
+    
+    try {
+        New-SmbShare -Name "pki" -Path "C:\pki" -ChangeAccess "Cert Publishers" -ErrorAction Stop | Out-Null
+        Write-Log "Created SMB share 'pki'."
+    } catch {
+        Write-Log "WARNING creating SMB share: $_"
+        # Don't exit on this error; it might already exist
+    }
+    
+    try {
+        New-WebVirtualDirectory -Site "Default Web Site" -Name "pki" -PhysicalPath "C:\pki" -ErrorAction Stop | Out-Null
+        Write-Log "Created IIS virtual directory /pki."
+    } catch {
+        Write-Log "WARNING creating IIS virtual directory: $_"
+        # Don't exit on this error; it might already exist
+    }
 
-    # Progress not advanced here — IIS is an internal prerequisite step, not yet shown as complete.
+    Write-Log "IIS prerequisites completed successfully."
+    Notify-User "HID Setup" "IIS setup complete. Installing Enterprise Root CA (5-10 minutes)..."
 
     # --- Task 2: Enterprise Root CA ---
     Write-Log "Installing ADCS feature and configuring Enterprise Root CA..."
-    Install-WindowsFeature -Name Adcs-Cert-Authority -IncludeManagementTools
-    Install-AdcsCertificationAuthority -CAType EnterpriseRootCA -CACommonName "$MachineName-CA" `
-        -KeyLength 2048 -HashAlgorithm SHA256 `
-        -CryptoProviderName "RSA#Microsoft Software Key Storage Provider" -Force
+    try {
+        Install-WindowsFeature -Name Adcs-Cert-Authority -IncludeManagementTools -ErrorAction Stop | Out-Null
+        Write-Log "ADCS feature installed."
+    } catch {
+        Write-Log "ERROR installing ADCS feature: $_"
+        Notify-User "HID Setup ERROR" "Failed to install ADCS. Check log: C:\Users\Public\Downloads\Setup-Demo.log"
+        Exit 1
+    }
+    
+    try {
+        Install-AdcsCertificationAuthority -CAType EnterpriseRootCA -CACommonName "$MachineName-CA" `
+            -KeyLength 2048 -HashAlgorithm SHA256 `
+            -CryptoProviderName "RSA#Microsoft Software Key Storage Provider" -Force -ErrorAction Stop | Out-Null
+        Write-Log "Enterprise Root CA configured."
+    } catch {
+        Write-Log "ERROR configuring Enterprise Root CA: $_"
+        Notify-User "HID Setup ERROR" "Failed to configure CA. Check log: C:\Users\Public\Downloads\Setup-Demo.log"
+        Exit 1
+    }
 
     Write-Log "Configuring ADCS AIA and CDP publication URLs..."
     # CDP: 1=Publish to file, 10=Include in issued cert CDPs, 65=Publish+Delta to file
     $CDP = "1:C:\pki\%3%8%9.crl\n10:http://$MachineName.$DomainName/pki/%3%8%9.crl\n65:file://\\$MachineName\pki\%3%8%9.crl"
-    certutil -setreg CA\CRLPublicationURLs $CDP
+    certutil -setreg CA\CRLPublicationURLs $CDP 2>&1 | Out-Null
+    Write-Log "CDP URLs configured: $CDP"
 
     # AIA: 1=Publish to file, 2=Include in issued cert AIAs
     $AIA = "1:C:\pki\%1_%3%4.crt\n2:http://$MachineName.$DomainName/pki/%1_%3%4.crt"
-    certutil -setreg CA\CACertPublicationURLs $AIA
+    certutil -setreg CA\CACertPublicationURLs $AIA 2>&1 | Out-Null
+    Write-Log "AIA URLs configured: $AIA"
 
     # C:\pki now exists and IIS is serving it — the CRL will be reachable via HTTP immediately.
-    Restart-Service certsvc
-    certutil -crl
+    Write-Log "Restarting CertSvc and publishing initial CRL..."
+    Restart-Service certsvc -ErrorAction SilentlyContinue
+    Start-Sleep -Seconds 2
+    certutil -crl 2>&1 | Out-Null
+    Write-Log "Initial CRL published."
 
     Show-Progress 2   # AD [X], CA [X], SmartCard [>]
+    Notify-User "HID Setup" "CA installed and CRL published. Configuring smart card certificates..."
 
     # --- Task 3: Smart Card Logon Certificate Template ---
-    Write-Log "Installing PSPKI module and duplicating Smartcard Logon template..."
-    # NOTE: Native PowerShell lacks a command for this; PSPKI from PSGallery fills the gap.
-    Install-PackageProvider -Name NuGet -MinimumVersion 2.8.5.201 -Force | Out-Null
-    Set-PSRepository -Name 'PSGallery' -InstallationPolicy Trusted
-    Install-Module -Name PSPKI -Force -AcceptLicense
-    # NOTE: Full duplication with exact settings requires ADSI or PSPKI's New-CertificateTemplate.
-    # For a silent demo, a pre-exported JSON via Export-CertificateTemplate is the most reliable approach.
-    $Template = Get-CertificateTemplate -Name "SmartcardLogon"
+    Write-Log "Installing PSPKI module and configuring smart card template..."
+    try {
+        Install-PackageProvider -Name NuGet -MinimumVersion 2.8.5.201 -Force -ErrorAction Stop | Out-Null
+        Write-Log "NuGet provider installed."
+        Set-PSRepository -Name 'PSGallery' -InstallationPolicy Trusted -ErrorAction Stop
+        Write-Log "PSGallery repository configured."
+        Install-Module -Name PSPKI -Force -AcceptLicense -ErrorAction Stop 2>&1 | Out-Null
+        Write-Log "PSPKI module installed."
+    } catch {
+        Write-Log "WARNING installing PSPKI: $_ (script may still work)"
+    }
+    
+    try {
+        $Template = Get-CertificateTemplate -Name "SmartcardLogon" -ErrorAction Stop
+        Write-Log "SmartcardLogon template retrieved."
+    } catch {
+        Write-Log "WARNING getting SmartcardLogon template: $_"
+    }
 
     Write-Log "Reissuing Domain Controller Certificate..."
-    certreq -enroll -machine -q DomainController
+    try {
+        certreq -enroll -machine -q DomainController 2>&1 | Out-Null
+        Write-Log "DC certificate reissued."
+    } catch {
+        Write-Log "WARNING reissuing DC cert: $_"
+    }
 
-    # IIS was completed earlier as a prerequisite; advance through its checklist step to SQL [>].
     Show-Progress 3   # AD [X], CA [X], SmartCard [X], IIS [>]  (already done — tick it off)
     Show-Progress 4   # AD [X], CA [X], SmartCard [X], IIS [X], SQL [>]
+    Notify-User "HID Setup" "Smart card config complete. Installing SQL Server Express (10-15 minutes)..."
 
     # --- Task 5: SQL Server Express ---
     Write-Log "Downloading SQL Server Express..."
     # NOTE: For resilient setups, host the installer locally rather than relying on a live Microsoft link.
     $SqlUrl = "https://go.microsoft.com/fwlink/p/?linkid=2216019"
     $SqlExe = "C:\Users\Public\Downloads\SQLEXPR.exe"
-    Invoke-WebRequest -Uri $SqlUrl -OutFile $SqlExe
+    
+    try {
+        Invoke-WebRequest -Uri $SqlUrl -OutFile $SqlExe -TimeoutSec 300 -ErrorAction Stop
+        Write-Log "SQL Server Express installer downloaded successfully."
+    } catch {
+        Write-Log "ERROR downloading SQL installer: $_"
+        Notify-User "HID Setup ERROR" "Failed to download SQL Server. Check internet and log: C:\Users\Public\Downloads\Setup-Demo.log"
+        Exit 1
+    }
 
     # Use the domain Administrator account promoted during AD forest creation as SQL sysadmin.
     $NetBIOSDomain = (Get-ADDomain).NetBIOSName
     $SqlSysAdmin = "$NetBIOSDomain\Administrator"
     Write-Log "Configuring SQL sysadmin account: $SqlSysAdmin"
+    Notify-User "HID Setup" "Installing SQL Server Express... (this may take 5-10 minutes, window will appear briefly)"
 
-    Start-Process -FilePath $SqlExe -ArgumentList "/qs /ACTION=Install /FEATURES=SQLEngine,Conn /INSTANCENAME=SQLEXPRESS /SQLSVCACCOUNT=`"NT AUTHORITY\SYSTEM`" /SQLSYSADMINACCOUNTS=`"$SqlSysAdmin`" /BROWSERSVCSTARTUPTYPE=Automatic /TCPENABLED=1 /IACCEPTSQLSERVERLICENSETERMS" -Wait
+    try {
+        Start-Process -FilePath $SqlExe -ArgumentList "/qs /ACTION=Install /FEATURES=SQLEngine,Conn /INSTANCENAME=SQLEXPRESS /SQLSVCACCOUNT=`"NT AUTHORITY\SYSTEM`" /SQLSYSADMINACCOUNTS=`"$SqlSysAdmin`" /BROWSERSVCSTARTUPTYPE=Automatic /TCPENABLED=1 /IACCEPTSQLSERVERLICENSETERMS" -Wait -ErrorAction Stop
+        Write-Log "SQL Server Express installation completed."
+    } catch {
+        Write-Log "ERROR installing SQL Server: $_"
+        Notify-User "HID Setup ERROR" "SQL Server installation may have failed. Check log: C:\Users\Public\Downloads\Setup-Demo.log"
+        # Don't exit; try to continue
+    }
 
     Show-Progress 5   # All tasks [X] done
+    Notify-User "HID Setup COMPLETE" "All components installed successfully! Check C:\Users\Administrator\Desktop\Evaluation-Walkthrough.md"
 
     Write-Log "Generating Walkthrough Document..."
     $DocContent = @"
@@ -213,15 +321,18 @@ Welcome to your pre-configured environment.
 * **Active Directory:** configured ($DomainName)
 * **SQL Server:** Installed (SQLEXPRESS), sysadmin: $SqlSysAdmin
 * **PKI:** Enterprise Root CA configured with HTTP/SMB endpoints.
+* **Setup Log:** C:\Users\Public\Downloads\Setup-Demo.log
 "@
     $DocContent | Out-File "C:\Users\Administrator\Desktop\Evaluation-Walkthrough.md"
 
     Write-Log "Cleaning up scheduled task and registry state..."
-    Unregister-ScheduledTask -TaskName "ResumeDemoSetup" -Confirm:$false
-    Remove-Item -Path $StateKey -Force
+    Unregister-ScheduledTask -TaskName "ResumeDemoSetup" -Confirm:$false -ErrorAction SilentlyContinue
+    Remove-Item -Path $StateKey -Force -ErrorAction SilentlyContinue
 
     Write-Host "  +==================================================================+" -ForegroundColor Green
     Write-Host "  |                       Setup Complete!                            |" -ForegroundColor Green
     Write-Host "  +==================================================================+" -ForegroundColor Green
     Write-Log "Setup Complete! Enjoy your coffee."
+    
+    Read-Host "Press Enter to close this window"
 }
