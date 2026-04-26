@@ -134,33 +134,23 @@ if ($State -eq 0) {
 }
 
 # ==============================================================================
-# STATE 1: AD Forest Promotion  (Stage 2 of 3)
+# STATE 1: AD Forest Promotion  (Restart 1 of 2 — computer renamed, domain not yet created)
 # ==============================================================================
 if ($State -eq 1) {
     Write-Host "`n`n`n"
     Write-Host "  +==================================================================+" -ForegroundColor Yellow
-    Write-Host "  |           SETUP RESUMING: Stage 2 of 3                           |" -ForegroundColor Yellow
-    Write-Host "  |         Installing Active Directory Forest...                   |" -ForegroundColor Yellow
+    Write-Host "  |  SETUP RESUMING (restart 1 of 2): Installing Active Directory   |" -ForegroundColor Yellow
+    Write-Host "  |  Computer renamed to $MachineName. Creating domain $DomainName..." + (' ' * [Math]::Max(0, 34 - $MachineName.Length - $DomainName.Length)) + "|" -ForegroundColor Yellow
     Write-Host "  +==================================================================+" -ForegroundColor Yellow
     Write-Host ""
-    Show-Progress 0   # Task 1 [>] in progress
+    Show-Progress 0   # Task 1 [>] Active Directory in progress
 
     Write-Log "Promoting server to Domain Controller ($DomainName)..."
     Set-ItemProperty -Path $StateKey -Name "State" -Value 2
 
-    # Re-register the resume task to run as Domain Admin in an interactive session.
-    # After this reboot the local Administrator becomes HID\Administrator, so SYSTEM
-    # (Session 0) is the wrong identity for ADCS, SMB shares, and SQL setup.
-    # Using AtLogon + Interactive means the script resumes visibly when the user logs in.
-    $NetBIOS = $DomainName.Split('.')[0].ToUpper()   # "hid.demo" -> "HID"
-    $DomainAdmin = "$NetBIOS\Administrator"
-    $SavedPath = (Get-ItemProperty -Path $StateKey).ScriptPath
-    $Action2 = New-ScheduledTaskAction -Execute 'PowerShell.exe' -Argument "-ExecutionPolicy Bypass -WindowStyle Maximized -NoExit -File `"$SavedPath`""
-    $Trigger2 = New-ScheduledTaskTrigger -AtLogOn -User $DomainAdmin
-    $Principal2 = New-ScheduledTaskPrincipal -UserId $DomainAdmin -LogonType Interactive -RunLevel Highest
-    Unregister-ScheduledTask -TaskName "ResumeDemoSetup" -Confirm:$false -ErrorAction SilentlyContinue
-    Register-ScheduledTask -TaskName "ResumeDemoSetup" -Action $Action2 -Trigger $Trigger2 -Principal $Principal2 -Force | Out-Null
-    Write-Log "Resume task updated: will run as $DomainAdmin in interactive session on next logon."
+    # No need to re-register the scheduled task here. Windows DC promotion preserves the local
+    # Administrator SID — CMS\Administrator becomes HID\Administrator with the same SID,
+    # so the AtLogon task registered in State 0 will fire correctly after this reboot.
 
     Install-ADDSForest -CreateDnsDelegation:$false -DatabasePath "C:\Windows\NTDS" `
         -DomainMode "7" -DomainName $DomainName -ForestMode "7" `
@@ -172,13 +162,13 @@ if ($State -eq 1) {
 }
 
 # ==============================================================================
-# STATE 2: IIS, ADCS, Smart Card Templates, SQL  (Stage 3 of 3)
+# STATE 2: IIS, ADCS, Smart Card Templates, SQL  (Restart 2 of 2 — domain ready)
 # ==============================================================================
 if ($State -eq 2) {
     Write-Host "`n`n`n"
     Write-Host "  +==================================================================+" -ForegroundColor Yellow
-    Write-Host "  |           SETUP RESUMING: Stage 3 of 3                           |" -ForegroundColor Yellow
-    Write-Host "  |    Installing Services & Applications...                        |" -ForegroundColor Yellow
+    Write-Host "  |  SETUP RESUMING (restart 2 of 2): Installing Services           |" -ForegroundColor Yellow
+    Write-Host "  |  Active Directory ready. Installing CA, IIS, and SQL...         |" -ForegroundColor Yellow
     Write-Host "  +==================================================================+" -ForegroundColor Yellow
     Write-Host ""
     Show-Progress 1   # AD [X], CA [>] next
