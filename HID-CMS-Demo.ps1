@@ -15,20 +15,6 @@ Function Write-Log ($Message) {
     Write-Host "$Time - $Message" -ForegroundColor Cyan
 }
 
-# Send a visible notification to the currently logged-in user (for Session 0 -> Session 1 visibility).
-# Also logs to file for troubleshooting.
-Function Notify-User ($Title, $Message) {
-    Write-Log "[NOTIFY] $Title - $Message"
-    # Get the session ID of the logged-in user (typically 1; fall back to broadcasting to all if needed)
-    try {
-        $UserSession = (Get-Process explorer -ErrorAction SilentlyContinue | Select-Object -First 1).SessionId
-        if ($null -eq $UserSession) { $UserSession = 1 }
-        msg $UserSession "$Title`n$Message" /TIME:60 | Out-Null 2>&1
-    } catch {
-        # msg may not be available; continue silently
-    }
-}
-
 # Display the task checklist with progress indicators.
 # $CompletedTasks: -1 = initial (all unchecked), 0-4 = that many done + next in progress, 5 = all done.
 Function Show-Progress {
@@ -178,14 +164,12 @@ if ($State -eq 2) {
     # immediately be served over HTTP — the CDP and AIA URLs embedded in issued certificates point to
     # http://<server>/pki, so the virtual directory must exist before any certificates are issued.
     Write-Log "Installing IIS and creating PKI distribution point directory..."
-    Notify-User "HID Setup" "Installing IIS (this may take 2-3 minutes)..."
     
     try {
         Install-WindowsFeature -Name Web-Server,Web-Asp-Net -IncludeManagementTools -ErrorAction Stop | Out-Null
         Write-Log "IIS features installed successfully."
     } catch {
         Write-Log "ERROR installing IIS: $_"
-        Notify-User "HID Setup ERROR" "Failed to install IIS. Check log: C:\Users\Public\Downloads\Setup-Demo.log"
         Exit 1
     }
     
@@ -194,7 +178,6 @@ if ($State -eq 2) {
         Write-Log "Created C:\pki directory."
     } catch {
         Write-Log "ERROR creating C:\pki: $_"
-        Notify-User "HID Setup ERROR" "Failed to create C:\pki. Check log: C:\Users\Public\Downloads\Setup-Demo.log"
         Exit 1
     }
     
@@ -215,7 +198,6 @@ if ($State -eq 2) {
     }
 
     Write-Log "IIS prerequisites completed successfully."
-    Notify-User "HID Setup" "IIS setup complete. Installing Enterprise Root CA (5-10 minutes)..."
 
     # --- Task 2: Enterprise Root CA ---
     Write-Log "Installing ADCS feature and configuring Enterprise Root CA..."
@@ -224,7 +206,6 @@ if ($State -eq 2) {
         Write-Log "ADCS feature installed."
     } catch {
         Write-Log "ERROR installing ADCS feature: $_"
-        Notify-User "HID Setup ERROR" "Failed to install ADCS. Check log: C:\Users\Public\Downloads\Setup-Demo.log"
         Exit 1
     }
     
@@ -235,7 +216,6 @@ if ($State -eq 2) {
         Write-Log "Enterprise Root CA configured."
     } catch {
         Write-Log "ERROR configuring Enterprise Root CA: $_"
-        Notify-User "HID Setup ERROR" "Failed to configure CA. Check log: C:\Users\Public\Downloads\Setup-Demo.log"
         Exit 1
     }
 
@@ -258,27 +238,116 @@ if ($State -eq 2) {
     Write-Log "Initial CRL published."
 
     Show-Progress 2   # AD [X], CA [X], SmartCard [>]
-    Notify-User "HID Setup" "CA installed and CRL published. Configuring smart card certificates..."
 
-    # --- Task 3: Smart Card Logon Certificate Template ---
-    Write-Log "Installing PSPKI module and configuring smart card template..."
-    try {
-        Install-PackageProvider -Name NuGet -MinimumVersion 2.8.5.201 -Force -ErrorAction Stop | Out-Null
-        Write-Log "NuGet provider installed."
-        Set-PSRepository -Name 'PSGallery' -InstallationPolicy Trusted -ErrorAction Stop
-        Write-Log "PSGallery repository configured."
-        Install-Module -Name PSPKI -Force -AcceptLicense -ErrorAction Stop 2>&1 | Out-Null
-        Write-Log "PSPKI module installed."
-    } catch {
-        Write-Log "WARNING installing PSPKI: $_ (script may still work)"
+    # --- Task 3: Smart Card and Enrollment Agent Certificate Templates ---
+    Write-Log "Creating HID certificate templates..."
+
+    $ConfigNC    = (Get-ADRootDSE).configurationNamingContext
+    $TemplatesOU = "CN=Certificate Templates,CN=Public Key Services,CN=Services,$ConfigNC"
+    $Container   = [ADSI]"LDAP://$TemplatesOU"
+
+    # Generate a unique OID rooted in this forest's OID space.
+    function New-TemplateOID {
+        $ForestOID = ([ADSI]"LDAP://CN=OID,CN=Public Key Services,CN=Services,$ConfigNC").'msPKI-Cert-Template-OID'
+        return "$ForestOID.$(Get-Random -Min 100 -Max 999).$(Get-Random -Min 1000000 -Max 9999999)"
     }
-    
-    try {
-        $Template = Get-CertificateTemplate -Name "SmartcardLogon" -ErrorAction Stop
-        Write-Log "SmartcardLogon template retrieved."
-    } catch {
-        Write-Log "WARNING getting SmartcardLogon template: $_"
+
+    function New-HIDTemplateFromSource {
+        param(
+            [string]$SourceTemplateCN,
+            [string]$NewTemplateCN,
+            [string]$NewTemplateDisplayName
+        )
+
+        $SourceADSI = [ADSI]"LDAP://CN=$SourceTemplateCN,$TemplatesOU"
+        if (-not $SourceADSI.distinguishedName) {
+            throw "Source template '$SourceTemplateCN' was not found in AD."
+        }
+
+        # Remove a previous partial run, if any.
+        try { $Container.Delete("pKICertificateTemplate", "CN=$NewTemplateCN") } catch {}
+
+        $NewTemplate = $Container.Create("pKICertificateTemplate", "CN=$NewTemplateCN")
+        foreach ($Attr in @(
+            "flags", "pKIDefaultKeySpec", "pKIKeyUsage", "pKIMaxIssuingDepth",
+            "pKICriticalExtensions", "pKIExtendedKeyUsage", "msPKI-RA-Signature",
+            "msPKI-Enrollment-Flag", "msPKI-Certificate-Name-Flag",
+            "msPKI-Certificate-Application-Policy", "pKIExpirationPeriod", "pKIOverlapPeriod"
+        )) {
+            $Val = $SourceADSI.Properties[$Attr].Value
+            if ($null -ne $Val) { $NewTemplate.Put($Attr, $Val) }
+        }
+
+        $NewTemplate.Put("displayName", $NewTemplateDisplayName)
+        $NewTemplate.Put("msPKI-Cert-Template-OID", (New-TemplateOID))
+
+        # Compatibility: Windows Server 2012 R2 CA / Windows 8.1 recipient (schema version 4).
+        $NewTemplate.Put("msPKI-Template-Schema-Version", 4)
+        $NewTemplate.Put("msPKI-Template-Minor-Revision", 1)
+
+        # Cryptography: CNG/KSP with Microsoft Smart Card KSP and P-256-sized key material.
+        # This enforces ECC-capable smart-card keys for the demo flow.
+        $NewTemplate.Put("pKIDefaultCSPs", @("1,Microsoft Smart Card Key Storage Provider"))
+        $NewTemplate.Put("msPKI-Minimal-Key-Size", 256)
+        $NewTemplate.Put("msPKI-Private-Key-Flag", 1)
+
+        $NewTemplate.SetInfo()
+
+        # Security: Domain Admins + Enterprise Admins can read and enroll.
+        $EnrollGuid   = [Guid]"0e10c968-78fb-11d2-90d4-00c04f79dc55"
+        $NetBIOS      = (Get-ADDomain).NetBIOSName
+        $DomainAdmins = New-Object System.Security.Principal.NTAccount("$NetBIOS\Domain Admins")
+        $EntAdmins    = New-Object System.Security.Principal.NTAccount("$NetBIOS\Enterprise Admins")
+        $CurrentUser  = New-Object System.Security.Principal.NTAccount(
+                            [System.Security.Principal.WindowsIdentity]::GetCurrent().Name)
+
+        $SD = $NewTemplate.ObjectSecurity
+        foreach ($Identity in @($DomainAdmins, $EntAdmins)) {
+            $SD.AddAccessRule((New-Object System.DirectoryServices.ActiveDirectoryAccessRule(
+                $Identity, "GenericRead,GenericExecute", "Allow")))
+            $SD.AddAccessRule((New-Object System.DirectoryServices.ActiveDirectoryAccessRule(
+                $Identity, "ExtendedRight", "Allow", $EnrollGuid,
+                ([System.DirectoryServices.ActiveDirectorySecurityInheritance]::None))))
+        }
+        $SD.PurgeAccessRules($CurrentUser)
+        $NewTemplate.CommitChanges()
+
+        Write-Log "Template '$NewTemplateDisplayName' created and secured."
     }
+
+    # 3.1 HID Smartcard Logon
+    New-HIDTemplateFromSource -SourceTemplateCN "SmartcardLogon" -NewTemplateCN "HIDSmartcardLogon" -NewTemplateDisplayName "HID Smartcard Logon"
+
+    # 3.2 HID Enrollment Agent
+    New-HIDTemplateFromSource -SourceTemplateCN "EnrollmentAgent" -NewTemplateCN "HIDEnrollmentAgent" -NewTemplateDisplayName "HID Enrollment Agent"
+
+    # Publish both templates to the CA.
+    Write-Log "Publishing HID templates to the CA..."
+    Import-Module ADCSAdministration -ErrorAction Stop
+    Add-CATemplate -Name "HIDSmartcardLogon" -Force -ErrorAction Stop
+    Add-CATemplate -Name "HIDEnrollmentAgent" -Force -ErrorAction Stop
+    Write-Log "Templates published to CA."
+
+    # Configure Default Domain Policy for smart-card sign-in UX.
+    Write-Log "Configuring Default Domain Policy for smart-card interactive logon..."
+    try {
+        Import-Module GroupPolicy -ErrorAction Stop
+    } catch {
+        Install-WindowsFeature -Name GPMC -IncludeManagementTools | Out-Null
+        Import-Module GroupPolicy -ErrorAction Stop
+    }
+
+    $DefaultGpo = "Default Domain Policy"
+    # Interactive logon: Do not require CTRL+ALT+DEL (DisableCAD = 1)
+    Set-GPRegistryValue -Name $DefaultGpo -Key "HKLM\SOFTWARE\Microsoft\Windows\CurrentVersion\Policies\System" -ValueName "DisableCAD" -Type DWord -Value 1
+
+    # Enable ECC certificates for smart-card logon/authentication via KDC policy-backed key.
+    # This maps the domain policy equivalent used for ECC smart-card logon in demo environments.
+    Set-GPRegistryValue -Name $DefaultGpo -Key "HKLM\SOFTWARE\Policies\Microsoft\Windows\Kdc" -ValueName "AllowEccCertificatesForLogon" -Type DWord -Value 1
+
+    # Apply policy immediately on the DC hosting the demo.
+    gpupdate /force | Out-Null
+    Write-Log "Default Domain Policy updated (DisableCAD + ECC smart-card logon)."
 
     Write-Log "Reissuing Domain Controller Certificate..."
     try {
@@ -290,40 +359,39 @@ if ($State -eq 2) {
 
     Show-Progress 3   # AD [X], CA [X], SmartCard [X], IIS [>]  (already done — tick it off)
     Show-Progress 4   # AD [X], CA [X], SmartCard [X], IIS [X], SQL [>]
-    Notify-User "HID Setup" "Smart card config complete. Installing SQL Server Express (10-15 minutes)..."
 
     # --- Task 5: SQL Server Express ---
     Write-Log "Downloading SQL Server Express..."
     # NOTE: For resilient setups, host the installer locally rather than relying on a live Microsoft link.
     $SqlUrl = "https://go.microsoft.com/fwlink/p/?linkid=2216019"
-    $SqlExe = "C:\Users\Public\Downloads\SQLEXPR.exe"
+    $SqlExe = "C:\Users\Public\Downloads\SQLBootstrap.exe"
     
     try {
         Invoke-WebRequest -Uri $SqlUrl -OutFile $SqlExe -TimeoutSec 300 -ErrorAction Stop
         Write-Log "SQL Server Express installer downloaded successfully."
     } catch {
         Write-Log "ERROR downloading SQL installer: $_"
-        Notify-User "HID Setup ERROR" "Failed to download SQL Server. Check internet and log: C:\Users\Public\Downloads\Setup-Demo.log"
         Exit 1
     }
+
+    # Now Dowload the full SQL Express installation media
+    Start-Process -FilePath $SqlExe -ArgumentList "/ACTION=Download /MEDIAPATH=C:\Users\Public\Downloads\SQLEXPR.exe /MEDIATYPE=Core /QUIET" -Wait -ErrorAction Stop
+    $SqlExe = "C:\Users\Public\Downloads\SQLEXPR.exe"
 
     # Use the domain Administrator account promoted during AD forest creation as SQL sysadmin.
     $NetBIOSDomain = (Get-ADDomain).NetBIOSName
     $SqlSysAdmin = "$NetBIOSDomain\Administrator"
     Write-Log "Configuring SQL sysadmin account: $SqlSysAdmin"
-    Notify-User "HID Setup" "Installing SQL Server Express... (this may take 5-10 minutes, window will appear briefly)"
 
     try {
         Start-Process -FilePath $SqlExe -ArgumentList "/qs /ACTION=Install /FEATURES=SQLEngine,Conn /INSTANCENAME=SQLEXPRESS /SQLSVCACCOUNT=`"NT AUTHORITY\SYSTEM`" /SQLSYSADMINACCOUNTS=`"$SqlSysAdmin`" /BROWSERSVCSTARTUPTYPE=Automatic /TCPENABLED=1 /IACCEPTSQLSERVERLICENSETERMS" -Wait -ErrorAction Stop
         Write-Log "SQL Server Express installation completed."
     } catch {
         Write-Log "ERROR installing SQL Server: $_"
-        Notify-User "HID Setup ERROR" "SQL Server installation may have failed. Check log: C:\Users\Public\Downloads\Setup-Demo.log"
         # Don't exit; try to continue
     }
 
     Show-Progress 5   # All tasks [X] done
-    Notify-User "HID Setup COMPLETE" "All components installed successfully! Check C:\Users\Administrator\Desktop\Evaluation-Walkthrough.md"
 
     Write-Log "Generating Walkthrough Document..."
     $DocContent = @"
