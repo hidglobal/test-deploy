@@ -587,6 +587,7 @@ if ($State -eq 2) {
         return
     }
 
+    $SqlSysAdmin = [System.Security.Principal.WindowsIdentity]::GetCurrent().Name
     if ($CurrentStatus.HasSqlExpress) {
         Write-Log "SQL Server Express is already installed. Skipping SQL installation."
     } else {
@@ -607,9 +608,8 @@ if ($State -eq 2) {
         Start-Process -FilePath $SqlExe -ArgumentList "/ACTION=Download /MEDIAPATH=C:\Users\Public\Downloads\SQLEXPR.exe /MEDIATYPE=Core /QUIET" -Wait -ErrorAction Stop
         $SqlExe = "C:\Users\Public\Downloads\SQLEXPR.exe"
 
-        # Use the domain Administrator account promoted during AD forest creation as SQL sysadmin.
-        $NetBIOSDomain = (Get-ADDomain).NetBIOSName
-        $SqlSysAdmin = "$NetBIOSDomain\Administrator"
+        # Use the account running setup as SQL sysadmin (works even if admin account was renamed).
+        $SqlSysAdmin = [System.Security.Principal.WindowsIdentity]::GetCurrent().Name
         Write-Log "Configuring SQL sysadmin account: $SqlSysAdmin"
 
         try {
@@ -632,7 +632,14 @@ Welcome to your pre-configured environment.
 * **PKI:** Enterprise Root CA configured with HTTP/SMB endpoints.
 * **Setup Log:** C:\Users\Public\Downloads\Setup-Demo.log
 "@
-    $DocContent | Out-File "C:\Users\Administrator\Desktop\Evaluation-Walkthrough.md"
+    $DesktopPath = [Environment]::GetFolderPath("Desktop")
+    if ([string]::IsNullOrWhiteSpace($DesktopPath) -or -not (Test-Path $DesktopPath)) {
+        $DesktopPath = "C:\Users\Public\Desktop"
+        New-Item -Path $DesktopPath -ItemType Directory -Force | Out-Null
+    }
+    $WalkthroughPath = Join-Path $DesktopPath "Evaluation-Walkthrough.md"
+    $DocContent | Out-File $WalkthroughPath
+    Write-Log "Walkthrough written to: $WalkthroughPath"
 
     Write-Log "Cleaning up scheduled task and registry state..."
     Unregister-ScheduledTask -TaskName "ResumeDemoSetup" -Confirm:$false -ErrorAction SilentlyContinue
