@@ -1,6 +1,11 @@
 # ==============================================================================
 # Demo Environment Orchestration Script
 # ==============================================================================
+param(
+    [switch]$OnlyTemplates,
+    [switch]$SkipConfirmation
+)
+
 $ErrorActionPreference = "Stop"
 $LogFile = "C:\Users\Public\Downloads\Setup-Demo.log"
 $MachineName = "CMS"
@@ -45,6 +50,139 @@ Function Show-Progress {
     Write-Host ""
 }
 
+function Test-EnterpriseCAInstalled {
+    $Svc = Get-Service -Name "CertSvc" -ErrorAction SilentlyContinue
+    if (-not $Svc) { return $false }
+
+    try {
+        $CaConfigRoot = "HKLM:\SYSTEM\CurrentControlSet\Services\CertSvc\Configuration"
+        $Children = Get-ChildItem -Path $CaConfigRoot -ErrorAction Stop | Where-Object { $_.PSChildName -ne "Configuration" }
+        return ($Children.Count -ge 1)
+    } catch {
+        return $false
+    }
+}
+
+function Test-IISPkiPublished {
+    $IisService = Get-Service -Name "W3SVC" -ErrorAction SilentlyContinue
+    if (-not $IisService) { return $false }
+    if (-not (Test-Path "C:\pki")) { return $false }
+
+    try {
+        Import-Module WebAdministration -ErrorAction Stop
+        return (Test-Path "IIS:\Sites\Default Web Site\pki")
+    } catch {
+        return $false
+    }
+}
+
+function Test-SQLExpressInstalled {
+    $Svc = Get-Service -Name "MSSQL`$SQLEXPRESS" -ErrorAction SilentlyContinue
+    return ($null -ne $Svc)
+}
+
+function Test-ADTemplateExists {
+    param([string]$TemplateCN)
+
+    try {
+        $ConfigNC = (Get-ADRootDSE).configurationNamingContext
+        $Template = [ADSI]"LDAP://CN=$TemplateCN,CN=Certificate Templates,CN=Public Key Services,CN=Services,$ConfigNC"
+        return [bool]$Template.distinguishedName
+    } catch {
+        return $false
+    }
+}
+
+function Test-TemplatePublishedToCA {
+    param(
+        [string]$TemplateCN,
+        [string]$TemplateDisplayName
+    )
+
+    try {
+        Import-Module ADCSAdministration -ErrorAction Stop
+        $Templates = Get-CATemplate -ErrorAction Stop
+        foreach ($T in $Templates) {
+            if ($T.Name -eq $TemplateCN -or $T.Name -eq $TemplateDisplayName) { return $true }
+        }
+    } catch {
+        return $false
+    }
+
+    return $false
+}
+
+function Get-DemoEnvironmentStatus {
+    $CS = Get-WmiObject -Class Win32_ComputerSystem
+    $IsDc = ($CS.DomainRole -ge 4)
+
+    $Status = [PSCustomObject]@{
+        IsDomainController   = $IsDc
+        HasIisAndPkiVDir     = $false
+        HasEnterpriseCA      = $false
+        HasTemplateObjects   = $false
+        HasTemplatesPublished= $false
+        HasSqlExpress        = $false
+    }
+
+    if ($IsDc) {
+        $Status.HasIisAndPkiVDir = Test-IISPkiPublished
+        $Status.HasEnterpriseCA = Test-EnterpriseCAInstalled
+        $Status.HasSqlExpress = Test-SQLExpressInstalled
+
+        $HasSc = Test-ADTemplateExists -TemplateCN "HIDSmartcardLogon"
+        $HasEa = Test-ADTemplateExists -TemplateCN "HIDEnrollmentAgent"
+        $Status.HasTemplateObjects = ($HasSc -and $HasEa)
+
+        $PubSc = Test-TemplatePublishedToCA -TemplateCN "HIDSmartcardLogon" -TemplateDisplayName "HID Smartcard Logon"
+        $PubEa = Test-TemplatePublishedToCA -TemplateCN "HIDEnrollmentAgent" -TemplateDisplayName "HID Enrollment Agent"
+        $Status.HasTemplatesPublished = ($PubSc -and $PubEa)
+    }
+
+    return $Status
+}
+
+function Show-EnvironmentChecklist {
+    param($Status)
+
+    Write-Host ""
+    Write-Host "  Current machine state:" -ForegroundColor White
+    Write-Host "  " + ([string]([char]0x2500) * 66) -ForegroundColor DarkGray
+
+    if ($Status.IsDomainController) {
+        Write-Host "  [X] Is the machine already a domain controller for a domain" -ForegroundColor Green
+    } else {
+        Write-Host "  [ ] Is the machine already a domain controller for a domain" -ForegroundColor DarkGray
+    }
+
+    if ($Status.HasIisAndPkiVDir) {
+        Write-Host "  [X] Is there IIS and the PKI virtual directory published" -ForegroundColor Green
+    } else {
+        Write-Host "  [ ] Is there IIS and the PKI virtual directory published" -ForegroundColor DarkGray
+    }
+
+    if ($Status.HasEnterpriseCA) {
+        Write-Host "  [X] Is there already an Enterprise CA" -ForegroundColor Green
+    } else {
+        Write-Host "  [ ] Is there already an Enterprise CA" -ForegroundColor DarkGray
+    }
+
+    if ($Status.HasTemplatesPublished) {
+        Write-Host "  [X] Are the templates published" -ForegroundColor Green
+    } else {
+        Write-Host "  [ ] Are the templates published" -ForegroundColor DarkGray
+    }
+
+    if ($Status.HasSqlExpress) {
+        Write-Host "  [X] Is SQL Server Express installed" -ForegroundColor Green
+    } else {
+        Write-Host "  [ ] Is SQL Server Express installed" -ForegroundColor DarkGray
+    }
+
+    Write-Host "  " + ([string]([char]0x2500) * 66) -ForegroundColor DarkGray
+    Write-Host ""
+}
+
 # Read current state (Default to 0 if starting fresh)
 $State = 0
 if (Test-Path $StateKey) {
@@ -55,6 +193,24 @@ if (Test-Path $StateKey) {
 }
 
 Write-Log "--- Starting Script at State: $State ---"
+
+# If this host was already promoted in a previous run, skip the fresh-server state machine.
+if ($State -eq 0) {
+    $DetectedStatus = Get-DemoEnvironmentStatus
+    if ($DetectedStatus.IsDomainController) {
+        Write-Log "Detected existing domain controller. Switching to resume mode (State 2)."
+        Show-EnvironmentChecklist -Status $DetectedStatus
+        if (-not $SkipConfirmation) {
+            $Resume = Read-Host "  Existing environment detected. Type YES to run only missing steps"
+            if ($Resume -ne "YES") {
+                Write-Host ""
+                Write-Host "  Setup cancelled." -ForegroundColor Red
+                Exit 0
+            }
+        }
+        $State = 2
+    }
+}
 
 # ==============================================================================
 # STATE 0: Pre-flight Check, Confirmation, Initial OS Configuration & ADDS Prep
@@ -159,83 +315,98 @@ if ($State -eq 2) {
     Write-Host ""
     Show-Progress 1   # AD [X], CA [>] next
 
+    $CurrentStatus = Get-DemoEnvironmentStatus
+    Show-EnvironmentChecklist -Status $CurrentStatus
+
     # --- IIS Web Server (installed first so C:\pki exists before ADCS publishes its CRL) ---
     # IIS must be in place before ADCS so that when certutil publishes the first CRL to C:\pki it can
     # immediately be served over HTTP — the CDP and AIA URLs embedded in issued certificates point to
     # http://<server>/pki, so the virtual directory must exist before any certificates are issued.
-    Write-Log "Installing IIS and creating PKI distribution point directory..."
-    
-    try {
-        Install-WindowsFeature -Name Web-Server,Web-Asp-Net -IncludeManagementTools -ErrorAction Stop | Out-Null
-        Write-Log "IIS features installed successfully."
-    } catch {
-        Write-Log "ERROR installing IIS: $_"
-        Exit 1
-    }
-    
-    try {
-        New-Item -Path "C:\pki" -ItemType Directory -Force -ErrorAction Stop | Out-Null
-        Write-Log "Created C:\pki directory."
-    } catch {
-        Write-Log "ERROR creating C:\pki: $_"
-        Exit 1
-    }
-    
-    try {
-        New-SmbShare -Name "pki" -Path "C:\pki" -ChangeAccess "Cert Publishers" -ErrorAction Stop | Out-Null
-        Write-Log "Created SMB share 'pki'."
-    } catch {
-        Write-Log "WARNING creating SMB share: $_"
-        # Don't exit on this error; it might already exist
-    }
-    
-    try {
-        New-WebVirtualDirectory -Site "Default Web Site" -Name "pki" -PhysicalPath "C:\pki" -ErrorAction Stop | Out-Null
-        Write-Log "Created IIS virtual directory /pki."
-    } catch {
-        Write-Log "WARNING creating IIS virtual directory: $_"
-        # Don't exit on this error; it might already exist
-    }
+    if ($OnlyTemplates) {
+        Write-Log "OnlyTemplates mode enabled. Skipping IIS and CA provisioning sections."
+    } elseif ($CurrentStatus.HasIisAndPkiVDir) {
+        Write-Log "IIS and PKI virtual directory already present. Skipping IIS configuration."
+    } else {
+        Write-Log "Installing IIS and creating PKI distribution point directory..."
 
-    Write-Log "IIS prerequisites completed successfully."
+        try {
+            Install-WindowsFeature -Name Web-Server,Web-Asp-Net -IncludeManagementTools -ErrorAction Stop | Out-Null
+            Write-Log "IIS features installed successfully."
+        } catch {
+            Write-Log "ERROR installing IIS: $_"
+            Exit 1
+        }
+
+        try {
+            New-Item -Path "C:\pki" -ItemType Directory -Force -ErrorAction Stop | Out-Null
+            Write-Log "Created C:\pki directory."
+        } catch {
+            Write-Log "ERROR creating C:\pki: $_"
+            Exit 1
+        }
+
+        try {
+            New-SmbShare -Name "pki" -Path "C:\pki" -ChangeAccess "Cert Publishers" -ErrorAction Stop | Out-Null
+            Write-Log "Created SMB share 'pki'."
+        } catch {
+            Write-Log "WARNING creating SMB share: $_"
+            # Don't exit on this error; it might already exist
+        }
+
+        try {
+            New-WebVirtualDirectory -Site "Default Web Site" -Name "pki" -PhysicalPath "C:\pki" -ErrorAction Stop | Out-Null
+            Write-Log "Created IIS virtual directory /pki."
+        } catch {
+            Write-Log "WARNING creating IIS virtual directory: $_"
+            # Don't exit on this error; it might already exist
+        }
+
+        Write-Log "IIS prerequisites completed successfully."
+    }
 
     # --- Task 2: Enterprise Root CA ---
-    Write-Log "Installing ADCS feature and configuring Enterprise Root CA..."
-    try {
-        Install-WindowsFeature -Name Adcs-Cert-Authority -IncludeManagementTools -ErrorAction Stop | Out-Null
-        Write-Log "ADCS feature installed."
-    } catch {
-        Write-Log "ERROR installing ADCS feature: $_"
-        Exit 1
+    if ($OnlyTemplates) {
+        Write-Log "OnlyTemplates mode enabled. Skipping CA provisioning section."
+    } elseif ($CurrentStatus.HasEnterpriseCA) {
+        Write-Log "Enterprise CA already configured. Skipping CA installation."
+    } else {
+        Write-Log "Installing ADCS feature and configuring Enterprise Root CA..."
+        try {
+            Install-WindowsFeature -Name Adcs-Cert-Authority -IncludeManagementTools -ErrorAction Stop | Out-Null
+            Write-Log "ADCS feature installed."
+        } catch {
+            Write-Log "ERROR installing ADCS feature: $_"
+            Exit 1
+        }
+
+        try {
+            Install-AdcsCertificationAuthority -CAType EnterpriseRootCA -CACommonName "$MachineName-CA" `
+                -KeyLength 2048 -HashAlgorithm SHA256 `
+                -CryptoProviderName "RSA#Microsoft Software Key Storage Provider" -Force -ErrorAction Stop | Out-Null
+            Write-Log "Enterprise Root CA configured."
+        } catch {
+            Write-Log "ERROR configuring Enterprise Root CA: $_"
+            Exit 1
+        }
+
+        Write-Log "Configuring ADCS AIA and CDP publication URLs..."
+        # CDP: 1=Publish to file, 10=Include in issued cert CDPs, 65=Publish+Delta to file
+        $CDP = "1:C:\pki\%3%8%9.crl\n10:http://$MachineName.$DomainName/pki/%3%8%9.crl\n65:file://\\$MachineName\pki\%3%8%9.crl"
+        certutil -setreg CA\CRLPublicationURLs $CDP 2>&1 | Out-Null
+        Write-Log "CDP URLs configured: $CDP"
+
+        # AIA: 1=Publish to file, 2=Include in issued cert AIAs
+        $AIA = "1:C:\pki\%1_%3%4.crt\n2:http://$MachineName.$DomainName/pki/%1_%3%4.crt"
+        certutil -setreg CA\CACertPublicationURLs $AIA 2>&1 | Out-Null
+        Write-Log "AIA URLs configured: $AIA"
+
+        # C:\pki now exists and IIS is serving it — the CRL will be reachable via HTTP immediately.
+        Write-Log "Restarting CertSvc and publishing initial CRL..."
+        Restart-Service certsvc -ErrorAction SilentlyContinue
+        Start-Sleep -Seconds 2
+        certutil -crl 2>&1 | Out-Null
+        Write-Log "Initial CRL published."
     }
-    
-    try {
-        Install-AdcsCertificationAuthority -CAType EnterpriseRootCA -CACommonName "$MachineName-CA" `
-            -KeyLength 2048 -HashAlgorithm SHA256 `
-            -CryptoProviderName "RSA#Microsoft Software Key Storage Provider" -Force -ErrorAction Stop | Out-Null
-        Write-Log "Enterprise Root CA configured."
-    } catch {
-        Write-Log "ERROR configuring Enterprise Root CA: $_"
-        Exit 1
-    }
-
-    Write-Log "Configuring ADCS AIA and CDP publication URLs..."
-    # CDP: 1=Publish to file, 10=Include in issued cert CDPs, 65=Publish+Delta to file
-    $CDP = "1:C:\pki\%3%8%9.crl\n10:http://$MachineName.$DomainName/pki/%3%8%9.crl\n65:file://\\$MachineName\pki\%3%8%9.crl"
-    certutil -setreg CA\CRLPublicationURLs $CDP 2>&1 | Out-Null
-    Write-Log "CDP URLs configured: $CDP"
-
-    # AIA: 1=Publish to file, 2=Include in issued cert AIAs
-    $AIA = "1:C:\pki\%1_%3%4.crt\n2:http://$MachineName.$DomainName/pki/%1_%3%4.crt"
-    certutil -setreg CA\CACertPublicationURLs $AIA 2>&1 | Out-Null
-    Write-Log "AIA URLs configured: $AIA"
-
-    # C:\pki now exists and IIS is serving it — the CRL will be reachable via HTTP immediately.
-    Write-Log "Restarting CertSvc and publishing initial CRL..."
-    Restart-Service certsvc -ErrorAction SilentlyContinue
-    Start-Sleep -Seconds 2
-    certutil -crl 2>&1 | Out-Null
-    Write-Log "Initial CRL published."
 
     Show-Progress 2   # AD [X], CA [X], SmartCard [>]
 
@@ -315,17 +486,66 @@ if ($State -eq 2) {
         Write-Log "Template '$NewTemplateDisplayName' created and secured."
     }
 
+    function Publish-HIDTemplate {
+        param(
+            [string]$TemplateCN,
+            [string]$TemplateDisplayName
+        )
+
+        Import-Module ADCSAdministration -ErrorAction Stop
+        $MaxAttempts = 6
+
+        for ($Attempt = 1; $Attempt -le $MaxAttempts; $Attempt++) {
+            $ExistsInAD = Test-ADTemplateExists -TemplateCN $TemplateCN
+            if (-not $ExistsInAD) {
+                Write-Log "Template '$TemplateCN' not yet visible in AD (attempt $Attempt/$MaxAttempts). Waiting 5s..."
+                Start-Sleep -Seconds 5
+                continue
+            }
+
+            if (Test-TemplatePublishedToCA -TemplateCN $TemplateCN -TemplateDisplayName $TemplateDisplayName) {
+                Write-Log "Template '$TemplateDisplayName' is already published to CA."
+                return
+            }
+
+            try {
+                Add-CATemplate -Name $TemplateCN -Force -ErrorAction Stop
+                Write-Log "Published template using CN '$TemplateCN'."
+                return
+            } catch {
+                try {
+                    Add-CATemplate -Name $TemplateDisplayName -Force -ErrorAction Stop
+                    Write-Log "Published template using display name '$TemplateDisplayName'."
+                    return
+                } catch {
+                    if ($Attempt -eq $MaxAttempts) {
+                        throw "Failed to publish template '$TemplateDisplayName' after $MaxAttempts attempts. Last error: $($_.Exception.Message)"
+                    }
+                    Write-Log "Publish attempt $Attempt/$MaxAttempts failed for '$TemplateDisplayName'. Retrying in 5s..."
+                    Start-Sleep -Seconds 5
+                }
+            }
+        }
+    }
+
     # 3.1 HID Smartcard Logon
-    New-HIDTemplateFromSource -SourceTemplateCN "SmartcardLogon" -NewTemplateCN "HIDSmartcardLogon" -NewTemplateDisplayName "HID Smartcard Logon"
+    if (-not (Test-ADTemplateExists -TemplateCN "HIDSmartcardLogon")) {
+        New-HIDTemplateFromSource -SourceTemplateCN "SmartcardLogon" -NewTemplateCN "HIDSmartcardLogon" -NewTemplateDisplayName "HID Smartcard Logon"
+    } else {
+        Write-Log "Template 'HID Smartcard Logon' already exists in AD. Skipping create."
+    }
 
     # 3.2 HID Enrollment Agent
-    New-HIDTemplateFromSource -SourceTemplateCN "EnrollmentAgent" -NewTemplateCN "HIDEnrollmentAgent" -NewTemplateDisplayName "HID Enrollment Agent"
+    if (-not (Test-ADTemplateExists -TemplateCN "HIDEnrollmentAgent")) {
+        New-HIDTemplateFromSource -SourceTemplateCN "EnrollmentAgent" -NewTemplateCN "HIDEnrollmentAgent" -NewTemplateDisplayName "HID Enrollment Agent"
+    } else {
+        Write-Log "Template 'HID Enrollment Agent' already exists in AD. Skipping create."
+    }
 
     # Publish both templates to the CA.
     Write-Log "Publishing HID templates to the CA..."
-    Import-Module ADCSAdministration -ErrorAction Stop
-    Add-CATemplate -Name "HIDSmartcardLogon" -Force -ErrorAction Stop
-    Add-CATemplate -Name "HIDEnrollmentAgent" -Force -ErrorAction Stop
+    Publish-HIDTemplate -TemplateCN "HIDSmartcardLogon" -TemplateDisplayName "HID Smartcard Logon"
+    Publish-HIDTemplate -TemplateCN "HIDEnrollmentAgent" -TemplateDisplayName "HID Enrollment Agent"
     Write-Log "Templates published to CA."
 
     # Configure Default Domain Policy for smart-card sign-in UX.
@@ -361,34 +581,44 @@ if ($State -eq 2) {
     Show-Progress 4   # AD [X], CA [X], SmartCard [X], IIS [X], SQL [>]
 
     # --- Task 5: SQL Server Express ---
-    Write-Log "Downloading SQL Server Express..."
-    # NOTE: For resilient setups, host the installer locally rather than relying on a live Microsoft link.
-    $SqlUrl = "https://go.microsoft.com/fwlink/p/?linkid=2216019"
-    $SqlExe = "C:\Users\Public\Downloads\SQLBootstrap.exe"
-    
-    try {
-        Invoke-WebRequest -Uri $SqlUrl -OutFile $SqlExe -TimeoutSec 300 -ErrorAction Stop
-        Write-Log "SQL Server Express installer downloaded successfully."
-    } catch {
-        Write-Log "ERROR downloading SQL installer: $_"
-        Exit 1
+    if ($OnlyTemplates) {
+        Write-Log "OnlyTemplates mode enabled. Skipping SQL installation and finishing now."
+        Write-Log "Template-only run completed successfully."
+        return
     }
 
-    # Now Dowload the full SQL Express installation media
-    Start-Process -FilePath $SqlExe -ArgumentList "/ACTION=Download /MEDIAPATH=C:\Users\Public\Downloads\SQLEXPR.exe /MEDIATYPE=Core /QUIET" -Wait -ErrorAction Stop
-    $SqlExe = "C:\Users\Public\Downloads\SQLEXPR.exe"
+    if ($CurrentStatus.HasSqlExpress) {
+        Write-Log "SQL Server Express is already installed. Skipping SQL installation."
+    } else {
+        Write-Log "Downloading SQL Server Express..."
+        # NOTE: For resilient setups, host the installer locally rather than relying on a live Microsoft link.
+        $SqlUrl = "https://go.microsoft.com/fwlink/p/?linkid=2216019"
+        $SqlExe = "C:\Users\Public\Downloads\SQLBootstrap.exe"
 
-    # Use the domain Administrator account promoted during AD forest creation as SQL sysadmin.
-    $NetBIOSDomain = (Get-ADDomain).NetBIOSName
-    $SqlSysAdmin = "$NetBIOSDomain\Administrator"
-    Write-Log "Configuring SQL sysadmin account: $SqlSysAdmin"
+        try {
+            Invoke-WebRequest -Uri $SqlUrl -OutFile $SqlExe -TimeoutSec 300 -ErrorAction Stop
+            Write-Log "SQL Server Express installer downloaded successfully."
+        } catch {
+            Write-Log "ERROR downloading SQL installer: $_"
+            Exit 1
+        }
 
-    try {
-        Start-Process -FilePath $SqlExe -ArgumentList "/qs /ACTION=Install /FEATURES=SQLEngine,Conn /INSTANCENAME=SQLEXPRESS /SQLSVCACCOUNT=`"NT AUTHORITY\SYSTEM`" /SQLSYSADMINACCOUNTS=`"$SqlSysAdmin`" /BROWSERSVCSTARTUPTYPE=Automatic /TCPENABLED=1 /IACCEPTSQLSERVERLICENSETERMS" -Wait -ErrorAction Stop
-        Write-Log "SQL Server Express installation completed."
-    } catch {
-        Write-Log "ERROR installing SQL Server: $_"
-        # Don't exit; try to continue
+        # Now Dowload the full SQL Express installation media
+        Start-Process -FilePath $SqlExe -ArgumentList "/ACTION=Download /MEDIAPATH=C:\Users\Public\Downloads\SQLEXPR.exe /MEDIATYPE=Core /QUIET" -Wait -ErrorAction Stop
+        $SqlExe = "C:\Users\Public\Downloads\SQLEXPR.exe"
+
+        # Use the domain Administrator account promoted during AD forest creation as SQL sysadmin.
+        $NetBIOSDomain = (Get-ADDomain).NetBIOSName
+        $SqlSysAdmin = "$NetBIOSDomain\Administrator"
+        Write-Log "Configuring SQL sysadmin account: $SqlSysAdmin"
+
+        try {
+            Start-Process -FilePath $SqlExe -ArgumentList "/qs /ACTION=Install /FEATURES=SQLEngine,Conn /INSTANCENAME=SQLEXPRESS /SQLSVCACCOUNT=`"NT AUTHORITY\SYSTEM`" /SQLSYSADMINACCOUNTS=`"$SqlSysAdmin`" /BROWSERSVCSTARTUPTYPE=Automatic /TCPENABLED=1 /IACCEPTSQLSERVERLICENSETERMS" -Wait -ErrorAction Stop
+            Write-Log "SQL Server Express installation completed."
+        } catch {
+            Write-Log "ERROR installing SQL Server: $_"
+            # Don't exit; try to continue
+        }
     }
 
     Show-Progress 5   # All tasks [X] done
