@@ -605,8 +605,8 @@ if ($State -eq 2) {
         }
 
         # Now Dowload the full SQL Express installation media
-        Start-Process -FilePath $SqlExe -ArgumentList "/ACTION=Download /MEDIAPATH=C:\Users\Public\Downloads\SQLEXPR.exe /MEDIATYPE=Core /QUIET" -Wait -ErrorAction Stop
-        $SqlExe = "C:\Users\Public\Downloads\SQLEXPR.exe"
+        Start-Process -FilePath $SqlExe -ArgumentList "/ACTION=Download /MEDIAPATH=C:\Users\Public\Downloads /MEDIATYPE=Core /QUIET" -Wait -ErrorAction Stop
+        $SqlExe = "C:\Users\Public\Downloads\SQLEXPR_x64_ENU.exe"
 
         # Use the account running setup as SQL sysadmin (works even if admin account was renamed).
         $SqlSysAdmin = [System.Security.Principal.WindowsIdentity]::GetCurrent().Name
